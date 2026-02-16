@@ -6,7 +6,8 @@ import requests
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import datetime
+from PIL import Image as PILImage  # <-- tambahan penting
 
 app = FastAPI()
 
@@ -19,17 +20,23 @@ DB_NAME = "posind_kurlog"
 DB_USER = "rda_analis"
 DB_PASSWORD = "GcTz69eZ6UwNnRhypjx9Ysk8"
 
+CHUNK_SIZE = 100  # maksimal 100 row per sheet
+
 
 @app.get("/download")
 def download_excel(
     customer_code: str = Query(..., description="Customer Code"),
     start_date: str = Query(..., description="Format: YYYYMMDD")
 ):
+
     # =========================
-    # VALIDASI & KONVERSI TANGGAL
+    # VALIDASI TANGGAL
     # =========================
-    start_dt = datetime.strptime(start_date, "%Y%m%d")
-    # end_dt = start_dt + timedelta(days=1)
+    try:
+        start_dt = datetime.strptime(start_date, "%Y%m%d")
+        start_date_sql = start_dt.strftime("%Y-%m-%d")
+    except ValueError:
+        return {"error": "Format tanggal harus YYYYMMDD"}
 
     # =========================
     # CONNECT REDSHIFT
@@ -42,9 +49,6 @@ def download_excel(
         password=DB_PASSWORD
     )
 
-    # =========================
-    # QUERY (AMAN - PARAMETERIZED)
-    # =========================
     query = """
     SELECT 
         t1.connote__connote_code,
@@ -59,66 +63,99 @@ def download_excel(
     JOIN nipos.nipos_pod_url t2
         ON t1.connote__connote_code = t2.connote__connote_code
     WHERE t1.customer_code = %s
-        AND date (t1.connote__created_at)= %s
+        AND date(t1.connote__created_at) = %s
     """
 
-    df = pd.read_sql(query, conn, params=(customer_code, start_date))
+    df = pd.read_sql(query, conn, params=(customer_code, start_date_sql))
     conn.close()
 
+    if df.empty:
+        return {"message": "Data tidak ditemukan"}
+
     # =========================
-    # BUAT EXCEL
+    # BUAT WORKBOOK
     # =========================
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Data"
+    wb.remove(wb.active)
 
-    ws.append(df.columns.tolist())
+    chunks = [df[i:i + CHUNK_SIZE] for i in range(0, len(df), CHUNK_SIZE)]
+    session = requests.Session()
 
-    for _, row in df.iterrows():
-        row_data = []
-        for col in df.columns:
-            if col in ["pod__photo", "pod__signature"]:
-                row_data.append("")
-            else:
-                row_data.append(row[col])
-        ws.append(row_data)
+    for sheet_index, chunk in enumerate(chunks, start=1):
 
-    # =========================
-    # INSERT GAMBAR
-    # =========================
-    def insert_image_from_url(url, cell):
-        if pd.isna(url):
-            return
-        try:
-            response = requests.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=10
-            )
-            if response.status_code == 200:
-                img_file = BytesIO(response.content)
-                img = Image(img_file)
+        ws = wb.create_sheet(title=f"Data_{sheet_index}")
+        ws.append(chunk.columns.tolist())
 
-                max_size = 120
-                ratio = min(max_size / img.width, max_size / img.height)
-                img.width = int(img.width * ratio)
-                img.height = int(img.height * ratio)
+        # Tulis data tanpa gambar dulu
+        for _, row in chunk.iterrows():
+            row_data = []
+            for col in chunk.columns:
+                if col in ["pod__photo", "pod__signature"]:
+                    row_data.append("")
+                else:
+                    row_data.append(row[col])
+            ws.append(row_data)
 
-                ws.add_image(img, cell)
-        except Exception:
-            pass
+        # =========================
+        # INSERT GAMBAR (VERSI COMPRESS)
+        # =========================
+        def insert_image_from_url(url, cell):
+            if pd.isna(url):
+                return
+            try:
+                response = session.get(
+                    url,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=5
+                )
 
-    if "pod__photo" in df.columns and "pod__signature" in df.columns:
+                if response.status_code == 200:
 
-        photo_col = df.columns.get_loc("pod__photo") + 1
-        sign_col = df.columns.get_loc("pod__signature") + 1
+                    # Buka pakai Pillow
+                    img = PILImage.open(BytesIO(response.content))
 
-        for i in range(len(df)):
+                    # Convert agar aman untuk JPEG
+                    if img.mode in ("RGBA", "P"):
+                        img = img.convert("RGB")
+
+                    # Resize fisik (bukan cuma tampilan)
+                    img.thumbnail((700, 700))  # max pixel
+
+                    # Compress
+                    compressed = BytesIO()
+                    img.save(
+                        compressed,
+                        format="JPEG",
+                        quality=60,       # turunkan kalau mau lebih kecil
+                        optimize=True
+                    )
+                    compressed.seek(0)
+
+                    excel_img = Image(compressed)
+
+                    # Resize tampilan di Excel
+                    max_display = 90
+                    ratio = min(
+                        max_display / excel_img.width,
+                        max_display / excel_img.height
+                    )
+                    excel_img.width = int(excel_img.width * ratio)
+                    excel_img.height = int(excel_img.height * ratio)
+
+                    ws.add_image(excel_img, cell)
+
+            except Exception:
+                pass
+
+        photo_col = chunk.columns.get_loc("pod__photo") + 1
+        sign_col = chunk.columns.get_loc("pod__signature") + 1
+
+        for i in range(len(chunk)):
             excel_row = i + 2
-            ws.row_dimensions[excel_row].height = 100
+            ws.row_dimensions[excel_row].height = 85
 
-            photo_url = df.iloc[i]["pod__photo"]
-            sign_url = df.iloc[i]["pod__signature"]
+            photo_url = chunk.iloc[i]["pod__photo"]
+            sign_url = chunk.iloc[i]["pod__signature"]
 
             photo_cell = ws.cell(row=excel_row, column=photo_col).coordinate
             sign_cell = ws.cell(row=excel_row, column=sign_col).coordinate
